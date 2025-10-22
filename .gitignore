@@ -1,0 +1,19 @@
+@"
+# Virtual env
+venv/
+.venv/
+env/
+
+# Env files
+.env
+.env.local
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE / OS
+.vscode/
+*.log
+.DS_Store
+"@ | Out-File -Encoding UTF8 .gitignore
