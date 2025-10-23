@@ -1,0 +1,4 @@
+yt-dlp==2025.9.26
+pydantic==2.12.2
+pydantic-settings==2.11.0
+
