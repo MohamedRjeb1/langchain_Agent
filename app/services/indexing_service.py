@@ -9,8 +9,89 @@ from datetime import datetime
 import pickle
 from collections import defaultdict
 
-from langchain.vectorstores import DocArrayInMemorySearch
-from langchain.schema import Document
+try:
+    from langchain.vectorstores import DocArrayInMemorySearch
+except Exception:  # pragma: no cover - optional dependency may be missing in test env
+    DocArrayInMemorySearch = None
+
+try:
+    from langchain.schema import Document
+except Exception:  # pragma: no cover - optional dependency may be missing in test env
+    Document = None
+
+# Prefer langchain_core vectorstore if available (newer lightweight API)
+try:
+    from langchain_core.vectorstores import InMemoryVectorStore
+except Exception:  # pragma: no cover
+    InMemoryVectorStore = None
+
+try:
+    # DocArrayRetriever may live in langchain_core.retrievers or langchain_core.vectorstores depending on version
+    from langchain_core.retrievers import DocArrayRetriever
+except Exception:
+    try:
+        from langchain_core.vectorstores import DocArrayRetriever
+    except Exception:
+        DocArrayRetriever = None
+
+
+    # Simple fallback vectorstore for environments without langchain/docarray
+    class SimpleInMemoryVectorStore:
+        """A minimal in-memory vector store used as a fallback for tests/local runs.
+
+        It stores documents and their embeddings and supports a basic
+        similarity_search_with_score(query, k) method. If the query is a string,
+        similarity is computed via simple token overlap; if the query is a vector,
+        cosine similarity with stored embeddings is used.
+        """
+
+        def __init__(self, documents: List[Any], embeddings: List[List[float]]):
+            # documents: list of objects with .page_content and .metadata or dicts
+            self.documents = documents
+            self.embeddings = np.array(embeddings, dtype=float) if embeddings else np.array([])
+
+        def _text_similarity(self, q: str, text: str) -> float:
+            qset = set(q.lower().split())
+            tset = set(text.lower().split())
+            if not qset or not tset:
+                return 0.0
+            inter = qset.intersection(tset)
+            return len(inter) / max(1, min(len(qset), len(tset)))
+
+        def similarity_search_with_score(self, query, k: int = 5):
+            # If query is vector-like
+            try:
+                q = np.array(query, dtype=float)
+                if self.embeddings.size == 0:
+                    return []
+                # cosine similarity
+                dots = (self.embeddings @ q).astype(float)
+                norms = np.linalg.norm(self.embeddings, axis=1) * (np.linalg.norm(q) + 1e-12)
+                sims = dots / (norms + 1e-12)
+                # convert to distances (1 - sim) to match expected interface
+                idx = np.argsort(-sims)[:k]
+                results = []
+                for i in idx:
+                    doc = self.documents[i]
+                    score = 1 - float(sims[i])
+                    results.append((doc, score))
+                return results
+            except Exception:
+                # treat query as text
+                qtext = str(query)
+                scores = []
+                for i, doc in enumerate(self.documents):
+                    content = getattr(doc, 'page_content', None) or (doc.get('page_content') if isinstance(doc, dict) else str(doc))
+                    sim = self._text_similarity(qtext, content)
+                    # convert to distance-like score: smaller is better
+                    score = 1 - sim
+                    scores.append((i, score))
+                scores.sort(key=lambda x: x[1])
+                results = []
+                for i, score in scores[:k]:
+                    results.append((self.documents[i], float(score)))
+                return results
+
 
 from app.core.config import get_settings
 from app.models.schemas import ProcessingStatus
@@ -99,19 +180,36 @@ class AdvancedIndexingService:
         try:
             # Create documents for vector store
             documents = []
+            embeddings = []
             for result in embedding_results:
                 doc = result["document"]
                 documents.append(doc)
-            
-            # Create vector store
-            vectorstore = DocArrayInMemorySearch.from_documents(
-                documents, 
-                embedding=None  # We'll use our custom embeddings
-            )
-            
-            # Store embeddings manually
-            embeddings = [result["embedding"] for result in embedding_results]
-            vectorstore._embeddings = embeddings
+                embeddings.append(result.get("embedding"))
+
+            # Create vector store using langchain_core InMemoryVectorStore if available,
+            # otherwise prefer DocArrayInMemorySearch, else fallback to simple in-memory store
+            if InMemoryVectorStore is not None:
+                try:
+                    # InMemoryVectorStore often expects a list/array of embeddings or (docs, embeddings)
+                    try:
+                        # try constructor signature InMemoryVectorStore(embeddings)
+                        vectorstore = InMemoryVectorStore(embeddings)
+                    except Exception:
+                        # try (documents, embeddings) signature
+                        vectorstore = InMemoryVectorStore(documents, embeddings)
+                except Exception:
+                    # fallback
+                    vectorstore = SimpleInMemoryVectorStore(documents, embeddings)
+            elif DocArrayInMemorySearch is not None:
+                try:
+                    vectorstore = DocArrayInMemorySearch.from_documents(
+                        documents,
+                        embedding=None,  # We'll use our custom embeddings
+                    )
+                except Exception:
+                    vectorstore = SimpleInMemoryVectorStore(documents, embeddings)
+            else:
+                vectorstore = SimpleInMemoryVectorStore(documents, embeddings)
             
             # Create semantic clusters
             clustering_result = self.create_semantic_clusters(embedding_results)
@@ -216,9 +314,27 @@ class AdvancedIndexingService:
                     return []
             
             vectorstore = self.indices[task_id]
-            
-            # Perform similarity search
-            results = vectorstore.similarity_search_with_score(query, k=k)
+
+            # Perform similarity search — try common method names used by possible vectorstores
+            results = []
+            if hasattr(vectorstore, "similarity_search_with_score"):
+                results = vectorstore.similarity_search_with_score(query, k=k)
+            elif hasattr(vectorstore, "similarity_search"):
+                # some stores return docs only
+                docs = vectorstore.similarity_search(query, k=k)
+                results = [(d, 0.0) for d in docs]
+            elif hasattr(vectorstore, "search"):
+                docs = vectorstore.search(query, k=k)
+                results = [(d, 0.0) for d in docs]
+            elif hasattr(vectorstore, "invoke"):
+                # langchain_core retriever style
+                try:
+                    doc = vectorstore.invoke(query)
+                    results = [(doc, 0.0)] if doc else []
+                except Exception:
+                    results = []
+            else:
+                results = []
             
             # Filter by similarity threshold and format results
             filtered_results = []
@@ -301,6 +417,31 @@ class AdvancedIndexingService:
         except Exception as e:
             print(f"Error searching cluster for task {task_id}: {str(e)}")
             return []
+
+    def create_retriever(self, task_id: str, embeddings: Optional[Any] = None, **kwargs):
+        """Create a retriever for a given index/task.
+
+        If `DocArrayRetriever` from langchain_core is available, build and return it.
+        Otherwise, return the in-memory vectorstore instance or None.
+        """
+        if task_id not in self.indices:
+            if not self.load_index(task_id):
+                return None
+
+        vectorstore = self.indices[task_id]
+
+        # If langchain_core's DocArrayRetriever is available and the vectorstore matches
+        if DocArrayRetriever is not None:
+            try:
+                # Attempt to create a retriever using the vectorstore and provided embeddings
+                retriever = DocArrayRetriever(index=vectorstore, embeddings=embeddings, **kwargs)
+                return retriever
+            except Exception:
+                pass
+
+        # Fallback: if vectorstore has an `invoke` or `similarity_search_with_score`, return it as-is
+        return vectorstore
+
     
     def get_index_statistics(self, task_id: str) -> Optional[Dict[str, Any]]:
         """

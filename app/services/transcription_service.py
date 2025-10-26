@@ -2,12 +2,14 @@
 Audio transcription service using Whisper.
 """
 import os
-import whisper
 from typing import Dict, Any, Optional
 from datetime import datetime
 
 from app.core.config import get_settings
 from app.models.schemas import ProcessingStatus
+
+# module-level placeholder so tests can monkeypatch `whisper` before it's imported
+whisper = None
 
 
 class TranscriptionService:
@@ -20,10 +22,11 @@ class TranscriptionService:
         # Ensure transcript directory exists
         os.makedirs(self.transcript_dir, exist_ok=True)
         
-        # Load Whisper model
-        self.model = whisper.load_model(self.settings.WHISPER_MODEL)
+        # Lazy load Whisper model to avoid heavy import at module load
+        # The module-level `whisper` may be monkeypatched in tests.
+        self.model = None
     
-    def transcribe_audio(self, audio_file: str, task_id: str, language: Optional[str] = None) -> Dict[str, Any]:
+    def transcribe_audio(self, audio_file: str, task_id: str, language: Optional[str] = "en") -> Dict[str, Any]:
         """
         Transcribe audio file to text.
         
@@ -38,13 +41,32 @@ class TranscriptionService:
         try:
             # Use provided language or default from settings
             transcribe_language = language or self.settings.WHISPER_LANGUAGE
-            
-            # Transcribe the audio
-            result = self.model.transcribe(
-                audio_file, 
-                language=transcribe_language,
-                verbose=False
-            )
+
+            # Lazy-load whisper model if not loaded yet. Support test monkeypatching of module-level whisper.
+            try:
+                # If a module-level `whisper` object exists (e.g., monkeypatched in tests), use it
+                whisper_mod = globals().get("whisper", None)
+                if whisper_mod is None:
+                    import whisper as whisper_mod
+                    # expose for potential monkeypatch
+                    globals()["whisper"] = whisper_mod
+
+                if self.model is None:
+                    self.model = whisper_mod.load_model(self.settings.WHISPER_MODEL)
+
+                # Transcribe the audio
+                result = self.model.transcribe(
+                    audio_file,
+                    language=transcribe_language,
+                    verbose=False,
+                )
+            except Exception as e:
+                return {
+                    "task_id": task_id,
+                    "status": ProcessingStatus.FAILED,
+                    "message": f"Transcription failed during model load/transcribe: {str(e)}",
+                    "error": str(e),
+                }
             
             transcript = result["text"].strip()
             detected_language = result.get("language", transcribe_language)

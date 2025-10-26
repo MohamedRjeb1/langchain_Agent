@@ -1,0 +1,48 @@
+from ast import main
+from langchain_ollama import OllamaLLM
+from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from app.services.transcription_service import TranscriptionService
+
+class ModelMistral:
+    def __init__(self, model_name="mistral"):
+        """
+        Initialise le modèle Mistral via Ollama.
+        """
+        self.transcription_service = TranscriptionService()
+        self.llm = OllamaLLM(model=model_name)
+
+    def summarize_transcript(self, transcript_id: str) -> str:
+        """
+        Récupère la transcription via le service et génère un résumé structuré.
+        
+        Args:
+            transcript_id (str): L'ID de la transcription à résumer.
+        
+        Returns:
+            str: Le résumé généré par le modèle.
+        """
+        # Récupérer la transcription
+        transcript = self.transcription_service.get_transcript(transcript_id)
+
+        # Créer le prompt pour le modèle
+        prompt_template = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                "You are a helpful assistant specialized in summarizing YouTube video transcripts."
+            ),
+            HumanMessagePromptTemplate.from_template(
+                f"""Given the transcript of a YouTube video, your task is to generate a straight to point and informative summary. \n
+             The summary should cover key points, main ideas, and critical information, organized in a coherent and structured way. \n
+              Ensure that the summary is not exceed 1000 words.\n
+             Make sure that the summary retains the flow and structure of the original transcript while omitting unnecessary details. \n
+              The summary should be easy to follow, informative, and structured, highlighting important tips, steps, or insights provided in the transcript.
+            \n\nTranscript:  {transcript} """
+            )
+        ])
+
+        # Générer le prompt final
+        prompt_with_var = prompt_template.invoke({"transcript": transcript})
+
+        # Générer le résumé avec le modèle
+        completion = self.llm.invoke(prompt_with_var)
+        return completion
+    
