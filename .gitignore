@@ -1,4 +1,30 @@
-@"
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+
+# OS/editor
+.DS_Store
+.vscode/
+
+# Streamlit & cache
+whisper_cache/
+
+# Project data outputs (do not commit)
+data/
+
+# Vector store artifacts (if any sneak in)
+*.faiss
+*_docs.json
+*_index_metadata.json
+
+# Logs
+logs/
+*.log@"
 # Virtual env
 venv/
 .venv/
