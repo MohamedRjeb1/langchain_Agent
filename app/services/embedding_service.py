@@ -26,6 +26,10 @@ class LocalEmbeddingService:
         """Initialise le modèle local Ollama."""
         try:
             self.model = OllamaEmbeddings(model=self.model_name)
+            # Compatibilité: certains appels attendent un attribut `.embeddings`
+            # qui expose embed_query/embed_documents (comme les wrappers LangChain).
+            # On pointe donc `embeddings` vers le modèle interne pour compatibilité.
+            self.embeddings = self.model
             print(f"Modèle d'embedding chargé : {self.model_name}")
         except Exception as e:
             print(f"Erreur lors du chargement du modèle local: {str(e)}")

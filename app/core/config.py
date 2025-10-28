@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     OPENPIPE_API_KEY: str = Field(default="open_pipe_api_key", description="OpenPipe API key")
     
     # Whisper settings
-    WHISPER_MODEL: str = Field(default="large", description="Whisper model size")
+    WHISPER_MODEL: str = Field(default="small", description="Whisper model size")
     WHISPER_LANGUAGE: str = Field(default="en", description="Whisper language")
     
     

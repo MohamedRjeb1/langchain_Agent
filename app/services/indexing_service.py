@@ -1,97 +1,21 @@
 """
-Advanced indexing service with innovative techniques.
+Advanced indexing service with robust FAISS backend.
+
+Key improvements vs the previous version:
+- Replace fragile DocArrayInMemorySearch + private _embeddings by a public FAISS wrapper.
+- Standardize cosine similarity via L2 normalization, returning scores in [0,1].
+- Persistence via faiss.write_index + JSON mapping (no pickle).
+- File locks to avoid concurrent writes corruption.
 """
 import os
 import json
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
-import pickle
 from collections import defaultdict
 
-try:
-    from langchain.vectorstores import DocArrayInMemorySearch
-except Exception:  # pragma: no cover - optional dependency may be missing in test env
-    DocArrayInMemorySearch = None
-
-try:
-    from langchain.schema import Document
-except Exception:  # pragma: no cover - optional dependency may be missing in test env
-    Document = None
-
-# Prefer langchain_core vectorstore if available (newer lightweight API)
-try:
-    from langchain_core.vectorstores import InMemoryVectorStore
-except Exception:  # pragma: no cover
-    InMemoryVectorStore = None
-
-try:
-    # DocArrayRetriever may live in langchain_core.retrievers or langchain_core.vectorstores depending on version
-    from langchain_core.retrievers import DocArrayRetriever
-except Exception:
-    try:
-        from langchain_core.vectorstores import DocArrayRetriever
-    except Exception:
-        DocArrayRetriever = None
-
-
-    # Simple fallback vectorstore for environments without langchain/docarray
-    class SimpleInMemoryVectorStore:
-        """A minimal in-memory vector store used as a fallback for tests/local runs.
-
-        It stores documents and their embeddings and supports a basic
-        similarity_search_with_score(query, k) method. If the query is a string,
-        similarity is computed via simple token overlap; if the query is a vector,
-        cosine similarity with stored embeddings is used.
-        """
-
-        def __init__(self, documents: List[Any], embeddings: List[List[float]]):
-            # documents: list of objects with .page_content and .metadata or dicts
-            self.documents = documents
-            self.embeddings = np.array(embeddings, dtype=float) if embeddings else np.array([])
-
-        def _text_similarity(self, q: str, text: str) -> float:
-            qset = set(q.lower().split())
-            tset = set(text.lower().split())
-            if not qset or not tset:
-                return 0.0
-            inter = qset.intersection(tset)
-            return len(inter) / max(1, min(len(qset), len(tset)))
-
-        def similarity_search_with_score(self, query, k: int = 5):
-            # If query is vector-like
-            try:
-                q = np.array(query, dtype=float)
-                if self.embeddings.size == 0:
-                    return []
-                # cosine similarity
-                dots = (self.embeddings @ q).astype(float)
-                norms = np.linalg.norm(self.embeddings, axis=1) * (np.linalg.norm(q) + 1e-12)
-                sims = dots / (norms + 1e-12)
-                # convert to distances (1 - sim) to match expected interface
-                idx = np.argsort(-sims)[:k]
-                results = []
-                for i in idx:
-                    doc = self.documents[i]
-                    score = 1 - float(sims[i])
-                    results.append((doc, score))
-                return results
-            except Exception:
-                # treat query as text
-                qtext = str(query)
-                scores = []
-                for i, doc in enumerate(self.documents):
-                    content = getattr(doc, 'page_content', None) or (doc.get('page_content') if isinstance(doc, dict) else str(doc))
-                    sim = self._text_similarity(qtext, content)
-                    # convert to distance-like score: smaller is better
-                    score = 1 - sim
-                    scores.append((i, score))
-                scores.sort(key=lambda x: x[1])
-                results = []
-                for i, score in scores[:k]:
-                    results.append((self.documents[i], float(score)))
-                return results
-
+from app.services.faiss_index import FAISSIndex, l2_normalize
+from app.services.embedding_service import LocalEmbeddingService
 
 from app.core.config import get_settings
 from app.models.schemas import ProcessingStatus
@@ -112,10 +36,12 @@ class AdvancedIndexingService:
         
         # Ensure vectorstore directory exists
         os.makedirs(self.vectorstore_dir, exist_ok=True)
-        
-        # Index storage
+
+        # Index storage (in-memory)
         self.indices = {}
         self.index_metadata = {}
+        # Lazy embedder init to avoid connecting to Ollama during tests or when not needed
+        self.embedder = None
     
     def create_semantic_clusters(self, embedding_results: List[Dict[str, Any]], n_clusters: int = 5) -> Dict[str, Any]:
         """
@@ -142,10 +68,11 @@ class AdvancedIndexingService:
             # Calculate silhouette score
             silhouette_avg = silhouette_score(embeddings, cluster_labels)
             
-            # Organize results by cluster
+            # Organize results by cluster (ensure JSON-serializable keys)
             clusters = defaultdict(list)
             for i, (result, label) in enumerate(zip(embedding_results, cluster_labels)):
-                clusters[label].append({
+                key = int(label) if not isinstance(label, (int, str)) else label
+                clusters[key].append({
                     "chunk_id": result["document"].metadata["chunk_id"],
                     "content": result["document"].page_content,
                     "metadata": result["document"].metadata,
@@ -153,7 +80,8 @@ class AdvancedIndexingService:
                 })
             
             return {
-                "clusters": dict(clusters),
+                # Convert any non-string keys to plain Python int to avoid numpy.int32 keys
+                "clusters": {int(k) if not isinstance(k, (int, str)) else k: v for k, v in clusters.items()},
                 "cluster_centers": kmeans.cluster_centers_.tolist(),
                 "silhouette_score": silhouette_avg,
                 "n_clusters": n_clusters,
@@ -178,38 +106,18 @@ class AdvancedIndexingService:
             Index creation result
         """
         try:
-            # Create documents for vector store
-            documents = []
-            embeddings = []
-            for result in embedding_results:
-                doc = result["document"]
-                documents.append(doc)
-                embeddings.append(result.get("embedding"))
-
-            # Create vector store using langchain_core InMemoryVectorStore if available,
-            # otherwise prefer DocArrayInMemorySearch, else fallback to simple in-memory store
-            if InMemoryVectorStore is not None:
-                try:
-                    # InMemoryVectorStore often expects a list/array of embeddings or (docs, embeddings)
-                    try:
-                        # try constructor signature InMemoryVectorStore(embeddings)
-                        vectorstore = InMemoryVectorStore(embeddings)
-                    except Exception:
-                        # try (documents, embeddings) signature
-                        vectorstore = InMemoryVectorStore(documents, embeddings)
-                except Exception:
-                    # fallback
-                    vectorstore = SimpleInMemoryVectorStore(documents, embeddings)
-            elif DocArrayInMemorySearch is not None:
-                try:
-                    vectorstore = DocArrayInMemorySearch.from_documents(
-                        documents,
-                        embedding=None,  # We'll use our custom embeddings
-                    )
-                except Exception:
-                    vectorstore = SimpleInMemoryVectorStore(documents, embeddings)
-            else:
-                vectorstore = SimpleInMemoryVectorStore(documents, embeddings)
+            # Prepare docs payload and embeddings
+            documents = [res["document"] for res in embedding_results]
+            embeddings = [res["embedding"] for res in embedding_results]
+            if len(embeddings) == 0:
+                raise ValueError("No embeddings provided to build the index")
+            dim = len(embeddings[0])
+            index = FAISSIndex(dim=dim, index_dir=self.vectorstore_dir, task_id=task_id)
+            docs_payload = [
+                {"content": d.page_content, "metadata": getattr(d, "metadata", {})}
+                for d in documents
+            ]
+            index.add(embeddings, docs_payload)
             
             # Create semantic clusters
             clustering_result = self.create_semantic_clusters(embedding_results)
@@ -220,24 +128,22 @@ class AdvancedIndexingService:
                 "created_at": datetime.now().isoformat(),
                 "total_chunks": len(embedding_results),
                 "embedding_model": self.settings.DEFAULT_EMBEDDING_MODEL,
+                "embedding_dimension": dim,
                 "chunk_size": self.settings.CHUNK_SIZE,
                 "chunk_overlap": self.settings.CHUNK_OVERLAP,
                 "clustering": clustering_result,
-                "index_type": "hybrid"
+                "index_type": "faiss"
             }
             
-            # Save index
-            index_file = os.path.join(self.vectorstore_dir, f"{task_id}_index.pkl")
-            with open(index_file, "wb") as f:
-                pickle.dump(vectorstore, f)
-            
-            # Save metadata
+            # Save index & metadata
+            index.save()
+            index_file = os.path.join(self.vectorstore_dir, f"{task_id}.faiss")
             metadata_file = os.path.join(self.vectorstore_dir, f"{task_id}_index_metadata.json")
             with open(metadata_file, "w", encoding="utf-8") as f:
                 json.dump(index_metadata, f, indent=2, ensure_ascii=False)
             
             # Store in memory
-            self.indices[task_id] = vectorstore
+            self.indices[task_id] = index
             self.index_metadata[task_id] = index_metadata
             
             return {
@@ -270,39 +176,44 @@ class AdvancedIndexingService:
             True if loaded successfully, False otherwise
         """
         try:
-            index_file = os.path.join(self.vectorstore_dir, f"{task_id}_index.pkl")
+            index_path = os.path.join(self.vectorstore_dir, f"{task_id}.faiss")
             metadata_file = os.path.join(self.vectorstore_dir, f"{task_id}_index_metadata.json")
-            
-            if not os.path.exists(index_file) or not os.path.exists(metadata_file):
+            if not os.path.exists(index_path) or not os.path.exists(metadata_file):
                 return False
-            
-            # Load index
-            with open(index_file, "rb") as f:
-                vectorstore = pickle.load(f)
-            
-            # Load metadata
+
+            # Load metadata first to get dimension
             with open(metadata_file, "r", encoding="utf-8") as f:
                 metadata = json.load(f)
-            
+            dim = int(metadata.get("embedding_dimension", self.settings.EMBEDDING_DIMENSION))
+
+            index = FAISSIndex(dim=dim, index_dir=self.vectorstore_dir, task_id=task_id)
+            ok = index.load()
+            if not ok:
+                return False
+
             # Store in memory
-            self.indices[task_id] = vectorstore
+            self.indices[task_id] = index
             self.index_metadata[task_id] = metadata
-            
+
             return True
             
         except Exception as e:
             print(f"Error loading index for task {task_id}: {str(e)}")
             return False
     
-    def search_similar(self, query: str, task_id: str, k: int = 5, similarity_threshold: float = 0.7) -> List[Dict[str, Any]]:
+    def search_similar(self, query: str, task_id: str, k: int = 5, similarity_threshold: float = 0.7, query_embedding: Optional[List[float]] = None, embed_query: bool = True) -> List[Dict[str, Any]]:
         """
-        Search for similar chunks using hybrid approach.
+        Search for similar chunks using cosine similarity on FAISS index.
+        - Embeddings are L2-normalized at index-time and query-time.
+        - Returned similarity is in [0,1].
         
         Args:
             query: Search query
             task_id: Task identifier
             k: Number of results to return
             similarity_threshold: Minimum similarity threshold
+            query_embedding: Optional precomputed embedding for the query
+            embed_query: If True and query_embedding is None, embed the query text
             
         Returns:
             List of similar chunks with scores
@@ -312,45 +223,51 @@ class AdvancedIndexingService:
             if task_id not in self.indices:
                 if not self.load_index(task_id):
                     return []
-            
-            vectorstore = self.indices[task_id]
 
-            # Perform similarity search — try common method names used by possible vectorstores
-            results = []
-            if hasattr(vectorstore, "similarity_search_with_score"):
-                results = vectorstore.similarity_search_with_score(query, k=k)
-            elif hasattr(vectorstore, "similarity_search"):
-                # some stores return docs only
-                docs = vectorstore.similarity_search(query, k=k)
-                results = [(d, 0.0) for d in docs]
-            elif hasattr(vectorstore, "search"):
-                docs = vectorstore.search(query, k=k)
-                results = [(d, 0.0) for d in docs]
-            elif hasattr(vectorstore, "invoke"):
-                # langchain_core retriever style
-                try:
-                    doc = vectorstore.invoke(query)
-                    results = [(doc, 0.0)] if doc else []
-                except Exception:
-                    results = []
-            else:
-                results = []
-            
-            # Filter by similarity threshold and format results
-            filtered_results = []
-            for doc, score in results:
-                # Convert distance to similarity (assuming cosine distance)
-                similarity = 1 - score if score <= 1 else 1 / (1 + score)
-                
-                if similarity >= similarity_threshold:
-                    filtered_results.append({
-                        "content": doc.page_content,
-                        "metadata": doc.metadata,
-                        "similarity_score": similarity,
-                        "distance_score": score
-                    })
-            
-            return filtered_results
+            index = self.indices[task_id]
+
+            # Determine query embedding
+            qe = query_embedding
+            if qe is None and embed_query:
+                if self.embedder is None:
+                    try:
+                        self.embedder = LocalEmbeddingService()
+                    except Exception:
+                        # If embedder cannot be initialized, we cannot embed the query
+                        return []
+                qe = self.embedder.embed_query(query)
+            if qe is None:
+                return []
+
+            # Primary FAISS search (already returns similarity in [0,1])
+            results = index.search(qe, k=k)
+
+            # Optional lightweight reranking with reconstructed vectors
+            try:
+                qe_norm = l2_normalize(np.asarray(qe, dtype=np.float32))[0]
+                reranked: List[Dict[str, Any]] = []
+                for r in results:
+                    rid = r.get("id")
+                    rv = index.reconstruct(rid) if rid is not None else None
+                    sim = r["similarity"]
+                    if rv is not None:
+                        rvn = l2_normalize(rv)[0]
+                        sim = float(np.dot(qe_norm, rvn))
+                        sim = max(0.0, min(1.0, sim))
+                    if sim >= similarity_threshold:
+                        reranked.append({
+                            "content": r["content"],
+                            "metadata": r["metadata"],
+                            "similarity_score": sim,
+                        })
+                reranked.sort(key=lambda x: x["similarity_score"], reverse=True)
+                return reranked
+            except Exception:
+                # Fallback: threshold and return as-is
+                return [
+                    {"content": r["content"], "metadata": r["metadata"], "similarity_score": r["similarity"]}
+                    for r in results if r["similarity"] >= similarity_threshold
+                ]
             
         except Exception as e:
             print(f"Error searching index for task {task_id}: {str(e)}")
@@ -417,31 +334,6 @@ class AdvancedIndexingService:
         except Exception as e:
             print(f"Error searching cluster for task {task_id}: {str(e)}")
             return []
-
-    def create_retriever(self, task_id: str, embeddings: Optional[Any] = None, **kwargs):
-        """Create a retriever for a given index/task.
-
-        If `DocArrayRetriever` from langchain_core is available, build and return it.
-        Otherwise, return the in-memory vectorstore instance or None.
-        """
-        if task_id not in self.indices:
-            if not self.load_index(task_id):
-                return None
-
-        vectorstore = self.indices[task_id]
-
-        # If langchain_core's DocArrayRetriever is available and the vectorstore matches
-        if DocArrayRetriever is not None:
-            try:
-                # Attempt to create a retriever using the vectorstore and provided embeddings
-                retriever = DocArrayRetriever(index=vectorstore, embeddings=embeddings, **kwargs)
-                return retriever
-            except Exception:
-                pass
-
-        # Fallback: if vectorstore has an `invoke` or `similarity_search_with_score`, return it as-is
-        return vectorstore
-
     
     def get_index_statistics(self, task_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -496,11 +388,12 @@ class AdvancedIndexingService:
                 del self.index_metadata[task_id]
             
             # Remove files
-            index_file = os.path.join(self.vectorstore_dir, f"{task_id}_index.pkl")
+            index_file = os.path.join(self.vectorstore_dir, f"{task_id}.faiss")
+            docs_map_file = os.path.join(self.vectorstore_dir, f"{task_id}_docs.json")
             metadata_file = os.path.join(self.vectorstore_dir, f"{task_id}_index_metadata.json")
             
             files_removed = 0
-            for file_path in [index_file, metadata_file]:
+            for file_path in [index_file, docs_map_file, metadata_file]:
                 if os.path.exists(file_path):
                     os.remove(file_path)
                     files_removed += 1
