@@ -33,6 +33,7 @@ with st.sidebar:
     st.markdown("---")
     st.header("Query")
     use_memory = st.checkbox("Use memory", value=True)
+    use_corrective = st.checkbox("Use Corrective RAG (self-grade & retry)", value=False)
     with st.expander("Diagnostics & Model Cache"):
         st.caption("Use this to validate the Python used by Streamlit and preload Whisper cache.")
         st.write("Python executable:")
@@ -119,7 +120,7 @@ if ask_btn and query:
     if svc is not None:
         append_log(f"[ui] Running query for task {task_id}: {query}")
         with st.spinner("Retrieving and answering — check logs for model/load progress..."):
-            out = svc.answer_query(task_id, query, k=5, similarity_threshold=0.0, use_memory=use_memory, progress_callback=append_log)
+            out = svc.answer_query(task_id, query, k=5, similarity_threshold=0.0, use_memory=use_memory, progress_callback=append_log, enable_corrective=use_corrective)
 
         if out.get("error"):
             append_log(f"[ui] Query error: {out.get('error')}")
@@ -130,7 +131,15 @@ if ask_btn and query:
             st.write(out.get("answer"))
             st.markdown("### Provenance")
             for p in out.get("provenance", []):
-                st.write(f"- {p.get('metadata',{}).get('chunk_id','')} : {p.get('content')[:300]}")
+                cid = p.get('metadata',{}).get('chunk_id','')
+                grade = p.get('grade', None)
+                sim = p.get('score', None)
+                prefix = f"- {cid}"
+                if grade is not None or sim is not None:
+                    gtxt = f" grade={grade:.2f}" if isinstance(grade, (int, float)) else ""
+                    stxt = f" sim={sim:.2f}" if isinstance(sim, (int, float)) else ""
+                    prefix += f" ({gtxt}{',' if gtxt and stxt else ''}{stxt})"
+                st.write(f"{prefix} : {p.get('content')[:300]}")
             st.markdown("### Used memory")
             for m in out.get("used_memory", []):
                 st.write(f"- {m.get('created_at')}: {m.get('text')}")

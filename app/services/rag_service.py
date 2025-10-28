@@ -4,7 +4,7 @@ and retriever + query answering (corrective RAG + memory RAG simple implementati
 This service constructs its own retriever from the index managed by AdvancedIndexingService
 and orchestrates LLM calls via LLMService.
 """
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import os
 import json
 from datetime import datetime
@@ -16,6 +16,7 @@ from app.services.llm_service import LLMService
 from app.services.semantic_chunking_service import SemanticChunkingService
 from app.services.transcription_service import TranscriptionService
 from app.services.youtube_service import YouTubeService
+import numpy as np
 
 
 class SimpleRetriever:
@@ -79,6 +80,91 @@ class CombinedRAGService:
 
         mem_path = os.path.join(self.settings.DATA_DIR, "memory.json")
         self.memory = MemoryStore(persist_path=mem_path)
+
+    # ---------- Corrective RAG helpers ----------
+    def _grade_knowledge_strips(self, query: str, strips: List[Dict[str, Any]], max_items: int = 8, progress_callback: Optional[callable] = None) -> List[Dict[str, Any]]:
+        """Ask the LLM to grade each strip for relevance to the query.
+
+        Returns a list of dicts: {chunk_id, grade (0-1), reason} aligned to input order when possible.
+        Robust to non-JSON outputs by best-effort parsing.
+        """
+        try:
+            items = []
+            for s in strips[:max_items]:
+                cid = (s.get("metadata") or {}).get("chunk_id", "")
+                items.append({"chunk_id": cid, "text": s.get("content", "")})
+
+            if not items:
+                return []
+
+            prompt = (
+                "You are a strict relevance grader. For each knowledge strip, output a JSON array where each item has: "
+                "{chunk_id: string, grade: number between 0 and 1, reason: short string}.\n"
+                "Grade measures how well the strip helps answer the query.\n\n"
+                f"Query: {query}\n\nKnowledge strips:\n"
+            )
+            for it in items:
+                prompt += f"- [{it['chunk_id']}] {it['text'][:600]}\n"
+            prompt += "\nReturn ONLY valid JSON (array)."
+
+            if progress_callback:
+                progress_callback("[llm] Grading retrieved knowledge strips for relevance")
+            out = self.llm.generate(prompt, max_tokens=400, temperature=0.0)
+            txt = out.get("text", "").strip()
+
+            import json as _json
+            grades: List[Dict[str, Any]] = []
+            try:
+                parsed = _json.loads(txt)
+                if isinstance(parsed, list):
+                    for obj in parsed:
+                        if not isinstance(obj, dict):
+                            continue
+                        cid = str(obj.get("chunk_id", ""))
+                        try:
+                            g = float(obj.get("grade", 0))
+                        except Exception:
+                            g = 0.0
+                        reason = str(obj.get("reason", ""))
+                        grades.append({"chunk_id": cid, "grade": max(0.0, min(1.0, g)), "reason": reason})
+            except Exception:
+                # Fallback: if JSON parsing fails, return empty grades to avoid blocking
+                grades = []
+
+            # Align grades back to strips order; if missing, default low grade
+            by_id = {g["chunk_id"]: g for g in grades}
+            aligned: List[Dict[str, Any]] = []
+            for s in strips[:max_items]:
+                cid = (s.get("metadata") or {}).get("chunk_id", "")
+                g = by_id.get(cid, {"grade": 0.0, "reason": "no-grade"})
+                aligned.append({"chunk_id": cid, "grade": g.get("grade", 0.0), "reason": g.get("reason", "")})
+            return aligned
+        except Exception:
+            return []
+
+    def _rewrite_queries(self, query: str, n: int = 2, progress_callback: Optional[callable] = None) -> List[str]:
+        """Ask the LLM to propose n concise reformulations of the query. Returns list of strings."""
+        try:
+            prompt = (
+                f"Rewrite the following user query into {n} alternative concise searches that might retrieve better evidence.\n"
+                "Return ONLY a JSON array of strings.\n\n"
+                f"Query: {query}\n"
+            )
+            if progress_callback:
+                progress_callback("[llm] Generating alternative query rewrites for corrective retrieval")
+            out = self.llm.generate(prompt, max_tokens=200, temperature=0.2)
+            txt = out.get("text", "").strip()
+            import json as _json
+            rewrites: List[str] = []
+            try:
+                parsed = _json.loads(txt)
+                if isinstance(parsed, list):
+                    rewrites = [str(x) for x in parsed if isinstance(x, (str, int, float))]
+            except Exception:
+                rewrites = []
+            return rewrites[:n]
+        except Exception:
+            return []
 
     def ingest_from_youtube(self, url: str, task_id: str, progress_callback: Optional[callable] = None) -> Dict[str, Any]:
         """Full ingestion flow for a YouTube URL.
@@ -194,16 +280,111 @@ class CombinedRAGService:
 
         return SimpleRetriever(self.indexer, task_id)
 
-    def answer_query(self, task_id: str, query: str, k: int = 5, similarity_threshold: float = 0.0, use_memory: bool = True, use_summary: bool = True, max_evidence_chars: int = 2000, progress_callback: Optional[callable] = None) -> Dict[str, Any]:
+    def answer_query(self, task_id: str, query: str, k: int = 5, similarity_threshold: float = 0.0, use_memory: bool = True, use_summary: bool = True, max_evidence_chars: int = 2000, progress_callback: Optional[callable] = None,
+                     enable_corrective: bool = False, grade_threshold: float = 0.6, max_retrieval_rounds: int = 1, num_rewrites: int = 2,
+                     memory_top_n: int = 2, memory_similarity_threshold: float = 0.5) -> Dict[str, Any]:
         """Answer a query using corrective RAG + optional memory.
 
         Returns: {answer, provenance: [chunks], used_memory: [...]}.
         """
         try:
             retriever = self.create_retriever(task_id)
-            results = retriever.retrieve(query, k=k, similarity_threshold=similarity_threshold)
 
-            # Grade strips: results already filtered by threshold in indexer.search_similar
+            # ---------------- Memory-augmented retrieval (for precision only) ----------------
+            # We will use past QA/queries to enhance retrieval, but we WON'T inject memory text into the prompt.
+            base_results = retriever.retrieve(query, k=k, similarity_threshold=similarity_threshold)
+
+            enhanced_results: List[Dict[str, Any]] = list(base_results)
+            mem_items = []
+            similar_qa_summaries: List[str] = []  # no longer used in prompt, retained for compatibility
+            mem_candidates: List[Tuple[float, Dict[str, Any], Optional[np.ndarray]]] = []  # (sim, mem, emb)
+            if use_memory:
+                # Fetch last 20 memory items
+                mem_items = self.memory.get(task_id, limit=20)
+                # Compute query embedding
+                try:
+                    q_emb_list = self.embedding.embed_query(query)
+                    qv = np.asarray(q_emb_list, dtype=np.float32)
+                    qv = qv / (np.linalg.norm(qv) + 1e-12)
+                except Exception:
+                    qv = None
+
+                if qv is not None:
+                    # Score memories by similarity to query
+                    scored: List[Tuple[float, Dict[str, Any], Optional[np.ndarray]]] = []
+                    for m in mem_items:
+                        mtext = m.get("text") or ""
+                        mmeta = m.get("metadata") or {}
+                        mtype = mmeta.get("type")
+                        if mtype not in ("qa", "query"):
+                            continue
+                        memb = m.get("embedding")
+                        if memb is None:
+                            try:
+                                memb = self.embedding.embed_query(mtext)
+                            except Exception:
+                                memb = None
+                        if memb is None:
+                            continue
+                        me = np.asarray(memb, dtype=np.float32)
+                        me = me / (np.linalg.norm(me) + 1e-12)
+                        sim = float(np.dot(qv, me))
+                        sim = max(0.0, min(1.0, sim))
+                        scored.append((sim, m, me))
+
+                    scored.sort(key=lambda x: x[0], reverse=True)
+                    picked = [(s, m, e) for (s, m, e) in scored if s >= memory_similarity_threshold][:memory_top_n]
+                    mem_candidates = picked
+
+                    # Retrieval using a centroid embedding (query + memory)
+                    if picked:
+                        try:
+                            mem_embs = [e for (_s, _m, e) in picked if e is not None]
+                            if mem_embs:
+                                mem_centroid = np.mean(np.stack(mem_embs, axis=0), axis=0)
+                                alpha = 0.5  # memory influence
+                                merged = qv + alpha * mem_centroid
+                                merged = merged / (np.linalg.norm(merged) + 1e-12)
+                                # use indexer directly to pass custom embedding
+                                enhanced_via_centroid = self.indexer.search_similar(
+                                    query="",
+                                    task_id=task_id,
+                                    k=k,
+                                    similarity_threshold=similarity_threshold,
+                                    query_embedding=merged.tolist(),
+                                    embed_query=False,
+                                )
+                                enhanced_results.extend(enhanced_via_centroid)
+                        except Exception:
+                            pass
+
+                    # Retrieval using memory-derived sub-queries (multi-query retrieval)
+                    for (_s, m, _e) in mem_candidates:
+                        # Try to extract the question part if present
+                        mtext = m.get("text") or ""
+                        qline = next((line.strip()[2:].strip() for line in mtext.splitlines() if line.strip().lower().startswith("q:")), None)
+                        subq = qline if qline else (mtext[:200])
+                        if not subq:
+                            continue
+                        try:
+                            r2 = retriever.retrieve(subq, k=max(2, k//2), similarity_threshold=similarity_threshold)
+                            enhanced_results.extend(r2)
+                        except Exception:
+                            continue
+
+            # Deduplicate results by chunk_id, keeping the highest similarity score
+            merged_map: Dict[str, Dict[str, Any]] = {}
+            for r in enhanced_results:
+                cid = (r.get("metadata") or {}).get("chunk_id", "")
+                if not cid:
+                    continue
+                cur = merged_map.get(cid)
+                if (cur is None) or (r.get("similarity_score", 0.0) > cur.get("similarity_score", 0.0)):
+                    merged_map[cid] = r
+            results = list(merged_map.values())
+            results.sort(key=lambda x: x.get("similarity_score", 0.0), reverse=True)
+
+            # Initial graded list based on similarity (always available)
             graded = []
             for r in results:
                 graded.append({
@@ -212,20 +393,79 @@ class CombinedRAGService:
                     "score": r.get("similarity_score", 0.0),
                 })
 
-            # If no high-quality strips, optionally include memory or return a message
-            mem_items = []
-            if use_memory:
-                mem_items = self.memory.get(task_id, limit=5)
+            # Optional Corrective RAG: self-grade strips and retry retrieval if weak
+            grade_info: List[Dict[str, Any]] = []
+            if enable_corrective and graded:
+                grade_info = self._grade_knowledge_strips(query, graded, max_items=min(8, len(graded)), progress_callback=progress_callback)
+                # attach grade to graded entries
+                by_id = {g["chunk_id"]: g for g in grade_info}
+                for g in graded:
+                    cid = (g.get("metadata") or {}).get("chunk_id", "")
+                    gi = by_id.get(cid)
+                    if gi:
+                        g["grade"] = gi.get("grade", 0.0)
+                        g["grade_reason"] = gi.get("reason", "")
+                    else:
+                        g["grade"] = 0.0
+                        g["grade_reason"] = "no-grade"
+
+                # Decide if we need corrective retrieval
+                best_grade = max((g.get("grade", 0.0) for g in graded), default=0.0)
+                if best_grade < grade_threshold:
+                    # Try one or more retrieval rounds with rewrites
+                    rounds = 0
+                    while rounds < max_retrieval_rounds:
+                        rounds += 1
+                        rewrites = self._rewrite_queries(query, n=num_rewrites, progress_callback=progress_callback)
+                        merged: List[Dict[str, Any]] = list(graded)
+                        seen_ids = {(m.get("metadata") or {}).get("chunk_id", "") for m in merged}
+                        for q2 in rewrites:
+                            if not q2:
+                                continue
+                            r2 = retriever.retrieve(q2, k=k, similarity_threshold=similarity_threshold)
+                            for rr in r2:
+                                cid2 = (rr.get("metadata") or {}).get("chunk_id", "")
+                                if cid2 in seen_ids:
+                                    continue
+                                merged.append({
+                                    "content": rr.get("content"),
+                                    "metadata": rr.get("metadata"),
+                                    "score": rr.get("similarity_score", 0.0),
+                                })
+                                seen_ids.add(cid2)
+                        # Re-grade on merged top items
+                        grade_info = self._grade_knowledge_strips(query, merged, max_items=min(8, len(merged)), progress_callback=progress_callback)
+                        by_id2 = {g["chunk_id"]: g for g in grade_info}
+                        for g in merged:
+                            cid = (g.get("metadata") or {}).get("chunk_id", "")
+                            gi = by_id2.get(cid)
+                            g["grade"] = gi.get("grade", 0.0) if gi else 0.0
+                            g["grade_reason"] = gi.get("reason", "") if gi else "no-grade"
+                        graded = merged
+                        best_grade = max((g.get("grade", 0.0) for g in graded), default=0.0)
+                        if best_grade >= grade_threshold:
+                            break
+
+                # After grading, prioritize by grade then similarity
+                graded.sort(key=lambda x: (x.get("grade", 0.0), x.get("score", 0.0)), reverse=True)
+                # Keep top-k
+                graded = graded[:k]
+
+            # We no longer append memory text to the prompt; memory is used only to enhance retrieval precision.
 
             # Build prompt: include top graded strips and memory
             prompt_parts = []
-            if mem_items:
-                prompt_parts.append("Memory context:\n")
-                for m in mem_items:
-                    prompt_parts.append(f"- {m.get('text')}\n")
+            # Do not include memory content in the prompt to comply with the new requirement.
 
             # Prepare evidence text and optionally summarize if too long
-            evidences = [f"[{g['metadata'].get('chunk_id','')}] {g['content']}" for g in graded]
+            # Build evidence text; if corrective grading present, annotate grade
+            evidences = []
+            for g in graded:
+                cid = g['metadata'].get('chunk_id','')
+                if enable_corrective and "grade" in g:
+                    evidences.append(f"[{cid}] (grade {g.get('grade', 0.0):.2f}, sim {g.get('score', 0.0):.2f}) {g['content']}")
+                else:
+                    evidences.append(f"[{cid}] {g['content']}")
             evidence_text = "\n".join(evidences)
             if use_summary and len(evidence_text) > max_evidence_chars:
                 if progress_callback:
@@ -254,7 +494,25 @@ class CombinedRAGService:
             answer_text = llm_out.get("text")
 
             # Store Q/A to memory
-            self.memory.add(task_id, text=query, metadata={"type": "query"}, embedding=None)
+            try:
+                # Store the query alone (lightweight)
+                q_emb_store = None
+                try:
+                    q_emb_store = self.embedding.embed_query(query)
+                except Exception:
+                    q_emb_store = None
+                self.memory.add(task_id, text=query, metadata={"type": "query"}, embedding=q_emb_store)
+                # Store combined QA for future similarity
+                qa_text = f"Q: {query}\nA: {answer_text or ''}"
+                qa_emb = None
+                try:
+                    qa_emb = self.embedding.embed_query(qa_text)
+                except Exception:
+                    qa_emb = None
+                self.memory.add(task_id, text=qa_text, metadata={"type": "qa"}, embedding=qa_emb)
+            except Exception:
+                # Non-fatal if persistence fails
+                pass
 
             return {"answer": answer_text, "provenance": graded, "used_memory": mem_items}
 
