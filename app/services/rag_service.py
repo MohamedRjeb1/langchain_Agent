@@ -13,6 +13,7 @@ from app.core.config import get_settings
 from app.services.indexing_service import AdvancedIndexingService
 from app.services.embedding_service import LocalEmbeddingService
 from app.services.llm_service import LLMService
+from app.services.router_service import LLMBasedRouter
 from app.services.semantic_chunking_service import SemanticChunkingService
 from app.services.transcription_service import TranscriptionService
 from app.services.youtube_service import YouTubeService
@@ -77,9 +78,99 @@ class CombinedRAGService:
         self.embedding = LocalEmbeddingService()
         self.indexer = AdvancedIndexingService()
         self.llm = LLMService(model_name=self.settings.DEFAULT_LLM_MODEL)
+        self.router = LLMBasedRouter(self.llm)
 
         mem_path = os.path.join(self.settings.DATA_DIR, "memory.json")
         self.memory = MemoryStore(persist_path=mem_path)
+
+    # ---------- Chat Orchestration ----------
+    def route_mode(self, latest_message: str, task_id: Optional[str], auto_retrieve: bool = True, force_rag: bool = False, chat_only: bool = False, llm_router: bool = False) -> Dict[str, Any]:
+        """Simple router deciding between 'rag' and 'chat'. Heuristic-only by default.
+
+        Returns: {mode: 'rag'|'chat', reason: str}
+        """
+        try:
+            msg = (latest_message or "").lower()
+            if chat_only:
+                return {"mode": "chat", "reason": "chat_only toggle"}
+            if force_rag:
+                if task_id:
+                    return {"mode": "rag", "reason": "force_rag toggle"}
+                return {"mode": "chat", "reason": "force_rag but no task selected"}
+            if not auto_retrieve:
+                return {"mode": "chat", "reason": "auto_retrieve disabled"}
+            if not task_id:
+                return {"mode": "chat", "reason": "no task selected"}
+
+            # LLM-based routing if requested and a task is selected
+            if llm_router:
+                try:
+                    det = self.router.detect_mode(latest_message)
+                    m = det.get("mode", "chat")
+                    raw = det.get("raw", "")
+                    if m == "rag":
+                        return {"mode": "rag", "reason": f"llm_router: {raw}"}
+                    return {"mode": "chat", "reason": f"llm_router: {raw}"}
+                except Exception as e:
+                    # Fall back to heuristics below
+                    pass
+
+            # Heuristic keywords
+            keywords = [
+                "video", "transcript", "dans la vidéo", "in the video", "speaker", "segment", "chunk",
+                "ce que la vidéo dit", "what the video", "whisper", "youtube"
+            ]
+            if any(k in msg for k in keywords):
+                return {"mode": "rag", "reason": "heuristic keywords matched"}
+
+            # If question seems factual and specific, prefer RAG; else chat
+            factual_signals = ["quel", "quelle", "combien", "when", "where", "who", "details", "exact"]
+            if any(k in msg for k in factual_signals):
+                return {"mode": "rag", "reason": "factual signal"}
+
+            return {"mode": "chat", "reason": "default chat"}
+        except Exception as e:
+            return {"mode": "chat", "reason": f"router error: {e}"}
+
+    def _build_chat_prompt(self, history: List[Dict[str, str]], latest_message: str, max_history: int = 8, do_summary: bool = True) -> str:
+        """Construct a chat prompt from a short history window and optional summary."""
+        hx = history[-max_history:]
+        conv_lines = []
+        for m in hx:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            conv_lines.append(f"{role}: {content}")
+        convo = "\n".join(conv_lines)
+        prompt = (
+            "You are a helpful and concise assistant. Answer naturally based on the ongoing conversation.\n"
+            "Conversation so far:\n" + convo + "\n\n"
+            "User: " + latest_message + "\nAssistant:"
+        )
+        # Minimal prompt; rolling summary can be added later if needed.
+        return prompt
+
+    def chat_respond(self, latest_message: str, history: List[Dict[str, str]], task_id: Optional[str] = None,
+                     auto_retrieve: bool = True, force_rag: bool = False, chat_only: bool = False, llm_router: bool = False,
+                     use_memory: bool = True, enable_corrective: bool = False,
+                     progress_callback: Optional[callable] = None) -> Dict[str, Any]:
+        """One chat turn: route to RAG or Chat, run, and return {mode_used, answer, provenance?}."""
+        route = self.route_mode(latest_message, task_id, auto_retrieve=auto_retrieve, force_rag=force_rag, chat_only=chat_only, llm_router=llm_router)
+        mode = route.get("mode", "chat")
+        reason = route.get("reason", "")
+        if progress_callback:
+            progress_callback(f"[router] mode={mode} reason={reason}")
+
+        if mode == "rag" and task_id:
+            # delegate to existing RAG answer; do not inject history text, keep retrieval-only memory boost
+            out = self.answer_query(task_id, latest_message, k=5, similarity_threshold=0.0, use_memory=use_memory, progress_callback=progress_callback, enable_corrective=enable_corrective)
+            return {"mode_used": "rag", **out}
+        else:
+            # general chat
+            prompt = self._build_chat_prompt(history, latest_message)
+            if progress_callback:
+                progress_callback("[llm] Generating chat response (no retrieval)")
+            llm_out = self.llm.generate(prompt, max_tokens=400, temperature=0.2)
+            return {"mode_used": "chat", "answer": llm_out.get("text", ""), "provenance": []}
 
     # ---------- Corrective RAG helpers ----------
     def _grade_knowledge_strips(self, query: str, strips: List[Dict[str, Any]], max_items: int = 8, progress_callback: Optional[callable] = None) -> List[Dict[str, Any]]:
@@ -113,9 +204,20 @@ class CombinedRAGService:
             txt = out.get("text", "").strip()
 
             import json as _json
+            import re as _re
             grades: List[Dict[str, Any]] = []
             try:
-                parsed = _json.loads(txt)
+                # Be robust to code fences or extra text: extract the JSON array portion if present
+                t = txt.strip()
+                if t.startswith("```"):
+                    # remove leading/trailing triple backticks blocks
+                    t = t.strip('`')
+                    # also try to drop a leading 'json' language tag
+                    if t.lower().startswith("json\n"):
+                        t = t[5:]
+                m = _re.search(r"\[.*\]", t, _re.DOTALL)
+                json_str = m.group(0) if m else t
+                parsed = _json.loads(json_str)
                 if isinstance(parsed, list):
                     for obj in parsed:
                         if not isinstance(obj, dict):
@@ -130,6 +232,8 @@ class CombinedRAGService:
             except Exception:
                 # Fallback: if JSON parsing fails, return empty grades to avoid blocking
                 grades = []
+                if progress_callback:
+                    progress_callback("[llm] Could not parse grading JSON; defaulting grades to 0.0")
 
             # Align grades back to strips order; if missing, default low grade
             by_id = {g["chunk_id"]: g for g in grades}
@@ -227,7 +331,7 @@ class CombinedRAGService:
             # Chunk
             if progress_callback:
                 progress_callback("[chunk] Creating semantic chunks")
-            chunks = self.chunker.create_semantic_chunks(transcript, task_id=task_id)
+            chunks = self.chunker.create_semantic_chunks(transcript, task_id=task_id, progress_callback=progress_callback)
 
             # Create Document objects expected by indexer: reuse existing chunk dicts
             docs = []
@@ -244,6 +348,8 @@ class CombinedRAGService:
             if progress_callback:
                 progress_callback("[embed] Embedding documents (embedding model may load now)")
             embeddings = self.embedding.embed_documents(texts)
+            if progress_callback:
+                progress_callback(f"[embed] Embeddings computed for {len(embeddings)} chunks")
 
             # Prepare embedding_results expected by AdvancedIndexingService
             embedding_results = []
@@ -254,6 +360,9 @@ class CombinedRAGService:
             if progress_callback:
                 progress_callback("[index] Creating index")
             idx_res = self.indexer.create_hybrid_index(embedding_results, task_id)
+            if progress_callback:
+                chunks_n = idx_res.get("total_chunks") if isinstance(idx_res, dict) else None
+                progress_callback(f"[index] Index created; total_chunks={chunks_n}")
 
             # Optionally add a summary memory entry
             summary_text = "".join([t[:400] + "..." for t in texts[:3]])
@@ -293,6 +402,14 @@ class CombinedRAGService:
             # ---------------- Memory-augmented retrieval (for precision only) ----------------
             # We will use past QA/queries to enhance retrieval, but we WON'T inject memory text into the prompt.
             base_results = retriever.retrieve(query, k=k, similarity_threshold=similarity_threshold)
+            if progress_callback and base_results:
+                progress_callback("[retrieval] Initial results:")
+                for r in base_results[:10]:
+                    cid = (r.get("metadata") or {}).get("chunk_id", "")
+                    progress_callback(
+                        f"  - id={cid} sim={r.get('similarity_score',0.0):.3f} "
+                        f"faiss={r.get('faiss_similarity','-')} cl={r.get('cluster_id','-')}"
+                    )
 
             enhanced_results: List[Dict[str, Any]] = list(base_results)
             mem_items = []
@@ -391,6 +508,9 @@ class CombinedRAGService:
                     "content": r.get("content"),
                     "metadata": r.get("metadata"),
                     "score": r.get("similarity_score", 0.0),
+                    "faiss_similarity": r.get("faiss_similarity"),
+                    "cluster_id": r.get("cluster_id"),
+                    "rank": r.get("rank"),
                 })
 
             # Optional Corrective RAG: self-grade strips and retry retrieval if weak
@@ -417,12 +537,16 @@ class CombinedRAGService:
                     while rounds < max_retrieval_rounds:
                         rounds += 1
                         rewrites = self._rewrite_queries(query, n=num_rewrites, progress_callback=progress_callback)
+                        if progress_callback:
+                            progress_callback(f"[retrieval] corrective round {rounds} rewrites={rewrites}")
                         merged: List[Dict[str, Any]] = list(graded)
                         seen_ids = {(m.get("metadata") or {}).get("chunk_id", "") for m in merged}
                         for q2 in rewrites:
                             if not q2:
                                 continue
                             r2 = retriever.retrieve(q2, k=k, similarity_threshold=similarity_threshold)
+                            if progress_callback and r2:
+                                progress_callback(f"[retrieval] rewrite '{q2}' returned {len(r2)} results")
                             for rr in r2:
                                 cid2 = (rr.get("metadata") or {}).get("chunk_id", "")
                                 if cid2 in seen_ids:
@@ -450,6 +574,14 @@ class CombinedRAGService:
                 graded.sort(key=lambda x: (x.get("grade", 0.0), x.get("score", 0.0)), reverse=True)
                 # Keep top-k
                 graded = graded[:k]
+                if progress_callback and graded:
+                    progress_callback("[retrieval] Final selected strips (after grading/retrieval):")
+                    for g in graded:
+                        cid = (g.get("metadata") or {}).get("chunk_id", "")
+                        progress_callback(
+                            f"  - id={cid} rank={g.get('rank','-')} sim={g.get('score',0.0):.3f} "
+                            f"grade={g.get('grade',0.0):.2f} cl={g.get('cluster_id','-')}"
+                        )
 
             # We no longer append memory text to the prompt; memory is used only to enhance retrieval precision.
 
@@ -463,9 +595,9 @@ class CombinedRAGService:
             for g in graded:
                 cid = g['metadata'].get('chunk_id','')
                 if enable_corrective and "grade" in g:
-                    evidences.append(f"[{cid}] (grade {g.get('grade', 0.0):.2f}, sim {g.get('score', 0.0):.2f}) {g['content']}")
+                    evidences.append(f"[{cid}] (grade {g.get('grade', 0.0):.2f}, sim {g.get('score', 0.0):.2f}, cl {g.get('cluster_id','-')}) {g['content']}")
                 else:
-                    evidences.append(f"[{cid}] {g['content']}")
+                    evidences.append(f"[{cid}] (sim {g.get('score', 0.0):.2f}, cl {g.get('cluster_id','-')}) {g['content']}")
             evidence_text = "\n".join(evidences)
             if use_summary and len(evidence_text) > max_evidence_chars:
                 if progress_callback:

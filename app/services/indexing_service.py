@@ -42,6 +42,40 @@ class AdvancedIndexingService:
         self.index_metadata = {}
         # Lazy embedder init to avoid connecting to Ollama during tests or when not needed
         self.embedder = None
+
+    # ---------- Introspection helpers (for UI diagnostics) ----------
+    def _ensure_chunk_cluster_map(self, task_id: str) -> Dict[str, int]:
+        """Build a map chunk_id -> cluster_id from stored clustering metadata.
+        Cached inside index_metadata[task_id]['_chunk_to_cluster'] for reuse.
+        """
+        meta = self.index_metadata.get(task_id)
+        if not meta:
+            return {}
+        cache_key = "_chunk_to_cluster"
+        if cache_key in meta:
+            return meta[cache_key]
+        clustering = (meta or {}).get("clustering", {})
+        clusters = clustering.get("clusters", {})
+        mapping: Dict[str, int] = {}
+        try:
+            for cid, items in clusters.items():
+                try:
+                    cidi = int(cid)
+                except Exception:
+                    cidi = cid
+                for it in items or []:
+                    ch_id = (it or {}).get("chunk_id")
+                    if ch_id is not None:
+                        mapping[str(ch_id)] = cidi
+        except Exception:
+            mapping = {}
+        meta[cache_key] = mapping
+        return mapping
+
+    def get_chunk_cluster(self, task_id: str, chunk_id: str) -> Optional[int]:
+        """Return the cluster id for a given chunk_id if clustering exists."""
+        m = self._ensure_chunk_cluster_map(task_id)
+        return m.get(str(chunk_id))
     
     def create_semantic_clusters(self, embedding_results: List[Dict[str, Any]], n_clusters: int = 5) -> Dict[str, Any]:
         """
@@ -241,12 +275,14 @@ class AdvancedIndexingService:
 
             # Primary FAISS search (already returns similarity in [0,1])
             results = index.search(qe, k=k)
+            # Keep FAISS similarity for diagnostics
+            faiss_list = list(results)
 
             # Optional lightweight reranking with reconstructed vectors
             try:
                 qe_norm = l2_normalize(np.asarray(qe, dtype=np.float32))[0]
                 reranked: List[Dict[str, Any]] = []
-                for r in results:
+                for i, r in enumerate(results):
                     rid = r.get("id")
                     rv = index.reconstruct(rid) if rid is not None else None
                     sim = r["similarity"]
@@ -255,19 +291,37 @@ class AdvancedIndexingService:
                         sim = float(np.dot(qe_norm, rvn))
                         sim = max(0.0, min(1.0, sim))
                     if sim >= similarity_threshold:
+                        # Attach cluster id if available
+                        chunk_id = (r.get("metadata") or {}).get("chunk_id", "")
+                        clu = self.get_chunk_cluster(task_id, chunk_id)
                         reranked.append({
                             "content": r["content"],
                             "metadata": r["metadata"],
                             "similarity_score": sim,
+                            "faiss_similarity": faiss_list[i]["similarity"],
+                            "cluster_id": clu,
                         })
                 reranked.sort(key=lambda x: x["similarity_score"], reverse=True)
+                # assign rank
+                for rank, item in enumerate(reranked, start=1):
+                    item["rank"] = rank
                 return reranked
             except Exception:
                 # Fallback: threshold and return as-is
-                return [
-                    {"content": r["content"], "metadata": r["metadata"], "similarity_score": r["similarity"]}
-                    for r in results if r["similarity"] >= similarity_threshold
-                ]
+                out = []
+                for i, r in enumerate(results):
+                    if r["similarity"] >= similarity_threshold:
+                        chunk_id = (r.get("metadata") or {}).get("chunk_id", "")
+                        clu = self.get_chunk_cluster(task_id, chunk_id)
+                        out.append({
+                            "content": r["content"],
+                            "metadata": r["metadata"],
+                            "similarity_score": r["similarity"],
+                            "faiss_similarity": r["similarity"],
+                            "cluster_id": clu,
+                            "rank": i + 1,
+                        })
+                return out
             
         except Exception as e:
             print(f"Error searching index for task {task_id}: {str(e)}")

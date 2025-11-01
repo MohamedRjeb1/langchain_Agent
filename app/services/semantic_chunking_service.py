@@ -148,7 +148,7 @@ class SemanticChunkingService:
         
         return merged_text.strip()
     
-    def create_semantic_chunks(self, text: str, task_id: str) -> List[Dict[str, Any]]:
+    def create_semantic_chunks(self, text: str, task_id: str, progress_callback: Optional[callable] = None) -> List[Dict[str, Any]]:
         """
         Crée des chunks sémantiques dynamiques.
         
@@ -169,7 +169,11 @@ class SemanticChunkingService:
             chunks = []
             current_chunk = [segments[0]]
             
-            print(f"Début du chunking sémantique pour {len(segments)} segments directs...")
+            start_msg = f"[chunk] Start semantic chunking: {len(segments)} segments"
+            if progress_callback:
+                progress_callback(start_msg)
+            else:
+                print("Début du chunking sémantique pour {} segments directs...".format(len(segments)))
             
             for i in range(1, len(segments)):
                 # Calculer la similarité avec le dernier segment du chunk actuel
@@ -177,6 +181,8 @@ class SemanticChunkingService:
                     current_chunk[-1], 
                     segments[i]
                 )
+                if progress_callback and i <= 1000:  # avoid overlogging for extremely large transcripts
+                    progress_callback(f"[chunk] seg {i}/{len(segments)} sim(prev->curr)={similarity:.3f}")
                 
                 # Calculer le seuil adaptatif
                 adaptive_threshold = self.calculate_adaptive_threshold(
@@ -218,13 +224,23 @@ class SemanticChunkingService:
                             }
                         }
                         chunks.append(chunk_data)
+                        if progress_callback:
+                            progress_callback(
+                                f"[chunk] finalize chunk idx={chunk_data['metadata']['chunk_index']} "
+                                f"segments={chunk_data['metadata']['segment_count']} "
+                                f"chars={chunk_data['metadata']['character_count']} thr={adaptive_threshold:.3f}"
+                            )
                     
                     # Commencer un nouveau chunk
                     current_chunk = [segments[i]]
                 
                 # Progress indicator
                 if i % 10 == 0:
-                    print(f"Traitement segment {i}/{len(segments)} - Chunks créés: {len(chunks)}")
+                    msg = f"[chunk] progress {i}/{len(segments)} segments, chunks={len(chunks)}"
+                    if progress_callback:
+                        progress_callback(msg)
+                    else:
+                        print(f"Traitement segment {i}/{len(segments)} - Chunks créés: {len(chunks)}")
             
             # Ajouter le dernier chunk s'il n'est pas vide
             if current_chunk and len(self.merge_chunk(current_chunk)) >= self.min_chunk_size:
@@ -245,8 +261,17 @@ class SemanticChunkingService:
                     }
                 }
                 chunks.append(chunk_data)
+                if progress_callback:
+                    progress_callback(
+                        f"[chunk] finalize last chunk idx={chunk_data['metadata']['chunk_index']} "
+                        f"segments={chunk_data['metadata']['segment_count']} chars={chunk_data['metadata']['character_count']}"
+                    )
             
-            print(f"Chunking sémantique terminé: {len(chunks)} chunks créés")
+            end_msg = f"[chunk] Completed semantic chunking: {len(chunks)} chunks created"
+            if progress_callback:
+                progress_callback(end_msg)
+            else:
+                print(f"Chunking sémantique terminé: {len(chunks)} chunks créés")
             return chunks
             
         except Exception as e:
