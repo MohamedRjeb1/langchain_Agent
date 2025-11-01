@@ -199,5 +199,5 @@ CHUNK_OVERLAP=64
 
 ## Licence
 
-Usage et redistribution sous la licence du projet (ajustez si nécessaire).
+Usage et redistribution sous la licence du projet.
 
