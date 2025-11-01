@@ -201,3 +201,33 @@ CHUNK_OVERLAP=64
 
 Usage et redistribution sous la licence du projet.
 
+
+## Demo
+
+Intégrez ici une courte vidéo de démonstration de l’application.
+
+- Placez votre fichier vidéo dans `docs/assets/demo.mp4` (ou un autre nom) pour qu’il soit versionné avec le dépôt.
+- Ce README l’embarque via une balise HTML5 et fournit un lien de repli.
+
+HTML5 (lecture intégrée sur GitHub si le format est supporté):
+
+<video src="docs/assets/demo.mp4" controls poster="docs/assets/demo-poster.png" width="800">
+	Votre navigateur ne supporte pas la lecture vidéo intégrée. 
+	<a href="docs/assets/demo.mp4">Voir la démo</a>.
+  
+</video>
+
+Lien de repli (au cas où HTML est filtré ou si vous préférez):
+
+- [Voir la démo](docs/assets/demo.mp4)
+
+Astuce taille du dépôt (optionnel): pour éviter d’alourdir l’historique Git, vous pouvez utiliser Git LFS pour les gros médias (mp4, mov, webm). Exemple rapide:
+
+```bash
+git lfs install
+git lfs track "*.mp4" "*.mov" "*.webm"
+git add .gitattributes
+git add docs/assets/demo.mp4
+git commit -m "Add demo video"
+```
+
